@@ -1,0 +1,22 @@
+{
+  "flight": "LY385",
+  "origin": "TLV",
+  "destination": "FCO",
+  "date": "2026-11-02",
+  "departure": "06:10",
+  "adults": 1,
+  "cabin": "economy",
+  "stop_at": "2026-11-02T06:10:00+02:00",
+  "calibrated": false,
+  "selectors": {
+    "results_ready": "",
+    "query_summary": "",
+    "flight_card": "",
+    "price": "",
+    "select_button": ""
+  },
+  "query_checks": [],
+  "direct_flight_pattern": "",
+  "currency_pattern": "(?:₪|USD|ILS|EUR|\\$|€)",
+  "public_search_actions": []
+}
