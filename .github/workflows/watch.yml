@@ -1,0 +1,101 @@
+name: EL AL flight watch
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: First diagnose, then bootstrap; check only after calibration
+        required: true
+        default: diagnose
+        type: choice
+        options: [diagnose, bootstrap, test-telegram, check]
+      telegram_username:
+        description: Your own Telegram username (bootstrap only; never paste a token here)
+        required: false
+        type: string
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elal-ly385-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: github.event_name == 'workflow_dispatch' || vars.MONITOR_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      MODE: ${{ github.event.inputs.mode || 'check' }}
+      TELEGRAM_USERNAME: ${{ github.event.inputs.telegram_username }}
+      SEARCH_URL: ${{ secrets.SEARCH_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check flight cutoff before installing anything
+        id: gate
+        run: |
+          python - <<'PY'
+          import json,os
+          from datetime import datetime
+          c=json.load(open('config.json'))
+          active=os.environ['MODE'] in ('bootstrap','test-telegram') or datetime.now().astimezone()<datetime.fromisoformat(c['stop_at'])
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('active='+str(active).lower()+'\n')
+          print('Run enabled.' if active else 'Flight cutoff reached. No browser or airline request.')
+          PY
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.active == 'true'
+        with:
+          python-version: '3.12'
+      - name: Validate decision logic
+        if: steps.gate.outputs.active == 'true'
+        run: python -m unittest discover -s tests -v
+      - name: Restore recent notification state
+        id: state
+        if: steps.gate.outputs.active == 'true' && env.MODE == 'check'
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: ly385-20261102-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ly385-20261102-state-
+      - name: Install browser library
+        if: steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || env.MODE == 'check')
+        run: pip install -r requirements.txt
+      - name: Restore Chromium
+        id: browser
+        if: steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || env.MODE == 'check')
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-linux-playwright-1.63.0
+      - name: Install Chromium
+        if: steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || env.MODE == 'check') && steps.browser.outputs.cache-hit != 'true'
+        run: python -m playwright install chromium --only-shell
+      - name: Run selected mode
+        if: steps.gate.outputs.active == 'true'
+        run: |
+          python - <<'PY'
+          import os,subprocess,sys
+          command=[sys.executable,'watch.py',os.environ['MODE']]
+          if os.environ['MODE']=='bootstrap': command+=['--username',os.environ.get('TELEGRAM_USERNAME','')]
+          sys.exit(subprocess.call(command))
+          PY
+      - name: Save notification state (including unsuccessful checks)
+        if: always() && steps.gate.outputs.active == 'true' && env.MODE == 'check'
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: ly385-20261102-state-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Keep diagnostic text for review
+        if: always() && steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || failure())
+        uses: actions/upload-artifact@v4
+        with:
+          name: flight-diagnostic-${{ github.run_id }}
+          path: diagnostics/report.json
+          if-no-files-found: ignore
+          retention-days: 5
