@@ -4,98 +4,92 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: First diagnose, then bootstrap; check only after calibration
+        description: probe = live search without Telegram; check = real monitoring run
         required: true
-        default: diagnose
+        default: probe
         type: choice
-        options: [diagnose, bootstrap, test-telegram, check]
+        options: [probe, check, test-telegram, bootstrap, diagnose]
       telegram_username:
         description: Your own Telegram username (bootstrap only; never paste a token here)
         required: false
         type: string
   schedule:
     - cron: '17 * * * *'
+  pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: elal-ly385-watch
+  group: elal-ly385-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'watch' }}
   cancel-in-progress: false
 
 jobs:
   watch:
-    if: github.event_name == 'workflow_dispatch' || vars.MONITOR_ENABLED == 'true'
+    if: github.event_name != 'schedule' || vars.MONITOR_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
     env:
-      MODE: ${{ github.event.inputs.mode || 'check' }}
+      MODE: ${{ github.event_name == 'pull_request' && 'probe' || github.event.inputs.mode || 'check' }}
       TELEGRAM_USERNAME: ${{ github.event.inputs.telegram_username }}
-      SEARCH_URL: ${{ secrets.SEARCH_URL }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       PYTHONUNBUFFERED: '1'
     steps:
-      - uses: actions/checkout@v4
-      - name: Check flight cutoff before installing anything
+      - uses: actions/checkout@v5
+      - name: Check flight cutoff
         id: gate
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import json,os
-          from datetime import datetime
+          from datetime import datetime,timezone
           c=json.load(open('config.json'))
-          active=os.environ['MODE'] in ('bootstrap','test-telegram') or datetime.now().astimezone()<datetime.fromisoformat(c['stop_at'])
+          active=os.environ['MODE'] in ('bootstrap','test-telegram') or datetime.now(timezone.utc)<datetime.fromisoformat(c['stop_at'])
           with open(os.environ['GITHUB_OUTPUT'],'a') as f: f.write('active='+str(active).lower()+'\n')
-          print('Run enabled.' if active else 'Flight cutoff reached. No browser or airline request.')
+          print('Run enabled.' if active else 'Flight cutoff reached. No search request.')
           PY
-      - uses: actions/setup-python@v5
+      - name: Disable the hourly schedule after the cutoff
+        if: steps.gate.outputs.active == 'false' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -sf -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/disable" \
+            && echo "Workflow disabled." || echo "::warning::Could not disable; disable it in the Actions tab."
+      - name: Unit tests
         if: steps.gate.outputs.active == 'true'
-        with:
-          python-version: '3.12'
-      - name: Validate decision logic
-        if: steps.gate.outputs.active == 'true'
-        run: python -m unittest discover -s tests -v
-      - name: Restore recent notification state
+        run: python3 -m unittest discover -s tests -v
+      - name: Restore state from the watch-state branch
         id: state
         if: steps.gate.outputs.active == 'true' && env.MODE == 'check'
-        uses: actions/cache/restore@v4
-        with:
-          path: .state
-          key: ly385-20261102-state-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ly385-20261102-state-
-      - name: Install browser library
-        if: steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || env.MODE == 'check')
-        run: pip install -r requirements.txt
-      - name: Restore Chromium
-        id: browser
-        if: steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || env.MODE == 'check')
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: chromium-linux-playwright-1.63.0
-      - name: Install Chromium
-        if: steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || env.MODE == 'check') && steps.browser.outputs.cache-hit != 'true'
-        run: python -m playwright install chromium --only-shell
+        run: |
+          mkdir -p .state
+          if git fetch -q --depth=1 origin watch-state; then
+            git show FETCH_HEAD:status.json > .state/status.json
+            echo "parent=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+            echo "Restored state:"; cat .state/status.json
+          else
+            echo "No previous state (first run)."
+          fi
       - name: Run selected mode
         if: steps.gate.outputs.active == 'true'
         run: |
-          python - <<'PY'
-          import os,subprocess,sys
-          command=[sys.executable,'watch.py',os.environ['MODE']]
-          if os.environ['MODE']=='bootstrap': command+=['--username',os.environ.get('TELEGRAM_USERNAME','')]
-          sys.exit(subprocess.call(command))
-          PY
-      - name: Save notification state (including unsuccessful checks)
+          if [ "$MODE" = bootstrap ]; then python3 watch.py bootstrap --username "$TELEGRAM_USERNAME"
+          else python3 watch.py "$MODE"; fi
+      - name: Save state to the watch-state branch
         if: always() && steps.gate.outputs.active == 'true' && env.MODE == 'check'
-        uses: actions/cache/save@v4
-        with:
-          path: .state
-          key: ly385-20261102-state-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Keep diagnostic text for review
-        if: always() && steps.gate.outputs.active == 'true' && (env.MODE == 'diagnose' || failure())
-        uses: actions/upload-artifact@v4
-        with:
-          name: flight-diagnostic-${{ github.run_id }}
-          path: diagnostics/report.json
-          if-no-files-found: ignore
-          retention-days: 5
+        env:
+          PARENT: ${{ steps.state.outputs.parent }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          [ -f .state/status.json ] || { echo "No state written."; exit 0; }
+          tree=$(printf '100644 blob %s\tstatus.json\n' "$(git hash-object -w .state/status.json)" | git mktree)
+          commit=$(git commit-tree "$tree" ${PARENT:+-p "$PARENT"} -m "state $(date -u +%FT%TZ)")
+          git push -q origin "$commit:refs/heads/watch-state"
+          echo "Saved state:"; cat .state/status.json
