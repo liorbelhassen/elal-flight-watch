@@ -1,23 +1,28 @@
-"""Browser experiment. Monitoring remains off until the live adapter is calibrated."""
+"""LY385 TLV->FCO 2026-11-02 availability watch (Google Flights source, Telegram alerts)."""
 import argparse
-from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+import gflights
 from logic import AVAILABLE, ABSENT, UNKNOWN, decide, expired, event_for, next_state
 
 ROOT = Path(__file__).resolve().parent
 REPORT = ROOT / "diagnostics"
 STATE = ROOT / ".state" / "status.json"
 CONFIG = ROOT / "config.json"
-BLOCKED = re.compile(r"captcha|access denied|verify you are human|unusual traffic|request blocked|incident id", re.I)
-SOLD_OUT = re.compile(r"sold\s*out|not available|unavailable|אזלו|אין מקומות|טיסה מלאה", re.I)
+ELAL_URL = "https://booking.elal.com/booking/flights?market=IL&lang=en"
+ISRAEL = ZoneInfo("Asia/Jerusalem")
+
+
+def israel_time(ts=None):
+    return datetime.fromtimestamp(ts or time.time(), ISRAEL).strftime("%d.%m.%Y %H:%M")
 
 
 def telegram(method, payload):
@@ -65,154 +70,122 @@ def bootstrap(username):
     if len(candidates) != 1:
         raise RuntimeError("Send /start LY385 to your own bot, then retry with your exact Telegram username.")
     chat_id = candidates.pop()
+    # The repository is public, so the chat ID goes only to the user's Telegram, never to the log.
     telegram("sendMessage", {"chat_id": chat_id, "text":
-             "✅ חיבור הטלגרם הצליח. זו הודעת בדיקה בלבד; מעקב הטיסה עדיין לא הופעל."})
-    print(f"TELEGRAM_CHAT_ID={chat_id}")
-
-
-def search_url(mode):
-    url = os.environ.get("SEARCH_URL", "").strip()
-    if not url and mode == "diagnose":
-        return "https://booking.elal.com/booking/flights?market=IL&lang=en"
-    parts = urllib.parse.urlsplit(url)
-    if (parts.scheme != "https" or parts.hostname != "booking.elal.com"
-            or parts.username or parts.password):
-        raise RuntimeError("SEARCH_URL must be a public HTTPS search URL on booking.elal.com.")
-    return url
+             "✅ חיבור הטלגרם הצליח (הודעת בדיקה, המעקב עדיין לא פעיל).\n"
+             f"מספר הצ'אט שלך: {chat_id}\n"
+             "שמור אותו ב־GitHub כ־Secret בשם TELEGRAM_CHAT_ID."})
+    print("Private chat found. Its ID was sent to your Telegram chat (not printed here).")
 
 
 def write_report(data):
     REPORT.mkdir(exist_ok=True)
     (REPORT / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write("```json\n" + json.dumps(data, ensure_ascii=False, indent=2) + "\n```\n")
 
 
-def inspect_once(config, url, diagnostic=False):
-    from playwright.sync_api import sync_playwright
-    report = {"timestamp": datetime.now(timezone.utc).isoformat(),
-              "target": {k: config[k] for k in ("flight", "origin", "destination", "date", "departure")}}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            context = browser.new_context(locale="en-US", timezone_id="Asia/Jerusalem")
-            page = context.new_page()
-            page.set_default_timeout(12000)
-            response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            report["http_status"] = response.status if response else None
-            if response and response.status >= 400:
-                report.update(status=UNKNOWN, reason="Search page returned an HTTP error.")
-                write_report(report)
-                return UNKNOWN, report
-            # Allow the public app to render; do not retry or bypass challenges.
-            page.wait_for_timeout(5000)
-            text = page.locator("body").inner_text(timeout=10000)
-            if BLOCKED.search(text):
-                report.update(status=UNKNOWN, reason="Site requested human verification or blocked access.")
-                write_report(report)
-                return UNKNOWN, report
-            for action in config.get("public_search_actions", []):
-                locator = page.locator(action["selector"])
-                if action["type"] == "click":
-                    locator.click()
-                elif action["type"] == "fill":
-                    locator.fill(action["value"])
-                else:
-                    raise RuntimeError("Unsupported public-search action.")
-            if diagnostic:
-                # No cookies, raw HTML, request bodies, screenshots or storage state are saved.
-                report["page_text"] = page.locator("body").inner_text()[:16000]
-                report["controls"] = page.locator("input,button,[role=button],[role=combobox]").evaluate_all("""els => els.slice(0,120).map(e => ({
-                  tag:e.tagName, type:e.getAttribute('type'), id:e.id,
-                  classes:e.className, name:e.getAttribute('name'),
-                  label:e.getAttribute('aria-label'), placeholder:e.getAttribute('placeholder'),
-                  text:(e.innerText||'').slice(0,160)}))""")
-                report.update(status="DIAGNOSTIC_ONLY", reason="Live selectors require calibration before monitoring.")
-                write_report(report)
-                return UNKNOWN, report
-            if not config.get("calibrated"):
-                report.update(status=UNKNOWN, reason="Adapter not calibrated; monitoring disabled.")
-                write_report(report)
-                return UNKNOWN, report
-            selectors = config["selectors"]
-            if not all(selectors.get(k) for k in ("results_ready", "query_summary", "flight_card", "price", "select_button")):
-                raise RuntimeError("Missing calibrated selectors.")
-            page.locator(selectors["results_ready"]).first.wait_for(state="visible", timeout=45000)
-            summary = page.locator(selectors["query_summary"]).inner_text()
-            cards = []
-            locators = page.locator(selectors["flight_card"])
-            for i in range(min(locators.count(), 100)):
-                card = locators.nth(i)
-                if not card.is_visible():
-                    continue
-                card_text = card.inner_text()
-                if not re.search(r"(?<![A-Z0-9])LY\s*0?385(?!\d)", card_text, re.I):
-                    cards.append({"text": card_text})
-                    continue
-                price = card.locator(selectors["price"])
-                button = card.locator(selectors["select_button"])
-                cards.append({"text": card_text,
-                              "price": price.first.inner_text() if price.count() else "",
-                              "button_visible": bool(button.count() and button.first.is_visible()),
-                              "button_enabled": bool(button.count() and button.first.is_enabled()),
-                              "sold_out": bool(SOLD_OUT.search(card_text))})
-            blocked = bool(BLOCKED.search(page.locator("body").inner_text()))
-            status, reason = decide(config, summary, cards, blocked=blocked)
-            report.update(status=status, reason=reason, query_summary=summary,
-                          matched_cards=[c for c in cards if re.search(r"LY\s*0?385(?!\d)", c["text"], re.I)])
-            write_report(report)
-            return status, report
-        finally:
-            browser.close()
+def brief(offer):
+    s = offer["segments"]
+    return {"flights": "+".join(f"{x['carrier']}{x['number']}" for x in s),
+            "departure": s[0]["departure"], "stops": len(s) - 1, "price": offer["price"]}
 
 
-def run_check(config, url):
-    if not config.get("calibrated"):
-        raise RuntimeError("Adapter is not calibrated. Run diagnose and finish live validation first.")
-    try:
-        status, report = inspect_once(config, url)
-    except Exception:
-        status, report = UNKNOWN, {"status": UNKNOWN, "reason": "Browser/search failed; not evidence that the flight is full."}
-        write_report(report)
+def inspect(config, date=None):
+    cfg = dict(config, date=date or config["date"])
+    result = gflights.search(cfg)
+    status, reason, offer, code = decide(cfg, result)
+    report = {"checked_at_israel": israel_time(), "source": "Google Flights", "date": cfg["date"],
+              "query": f"{cfg['origin']}->{cfg['destination']} one-way, {cfg['adults']} adult, economy, {cfg['currency']}",
+              "url": result.get("url"), "http_status": result.get("http_status"),
+              "status": status, "reason": reason, "code": code,
+              "match": brief(offer) if offer else None,
+              "nonstop_results": [brief(o) for o in result.get("offers", []) if len(o["segments"]) == 1]}
+    return status, report, offer, code
+
+
+def alert_text(config, offer, url, ts):
+    return ("✈️ LY385 מוצעת לבחירה ב־Google Flights\n"
+            "אל על, תל אביב (TLV) → רומא פיומיצ'ינו (FCO)\n"
+            f"יום שני 2.11.2026, יציאה {offer['segments'][0]['departure']}, טיסה ישירה\n"
+            "מבוגר אחד, הלוך בלבד, תיירים\n"
+            f"מחיר מוצג: ₪{offer['price']} (נמצא בשתי בדיקות טריות)\n"
+            f"נבדק: {israel_time(ts)} (שעון ישראל)\n"
+            "המקור הוא Google Flights ולא אתר אל על; המחיר והמקום כפופים לאישור בזמן ההזמנה. לא בוצעה הזמנה.\n"
+            f"החיפוש: {url}")
+
+
+def run_check(config, sleep=time.sleep):
+    status, report, offer, code = inspect(config)
     if status == AVAILABLE:
-        # Confirm with another fresh browser, with no prior session/cookies.
-        try:
-            confirmation, second = inspect_once(config, url)
-        except Exception:
-            confirmation = UNKNOWN
-        if confirmation != AVAILABLE:
-            status = UNKNOWN
-            report.update(status=UNKNOWN, reason="Positive result did not repeat in a fresh search.")
+        sleep(config.get("confirm_delay_seconds", 60))
+        second, report2, offer2, _ = inspect(config)
+        if second != AVAILABLE or brief(offer2)["departure"] != brief(offer)["departure"]:
+            status, code = UNKNOWN, "unconfirmed"
+            report.update(status=UNKNOWN, code=code,
+                          reason=f"Positive result did not repeat in a fresh search ({report2['reason']}).")
         else:
             report["confirmed_twice"] = True
-        write_report(report)
+            offer = offer2
+    write_report(report)
     try:
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
         state = {}
     now = time.time()
-    event = event_for(state, status, now)
+    event = event_for(state, status, now, code)
     if event == "available":
-        send("✈️ נמצאה הצעה לבחירה לטיסת אל על LY385\n"
-             "תל אביב → רומא, 2.11.2026, 06:10\n"
-             "נוסע אחד, הלוך בלבד, תיירים. התוצאה חזרה בשתי בדיקות טריות.\n"
-             "המחיר והכרטיס עדיין כפופים לאישור באתר; לא בוצעה הזמנה.\n" + url)
+        send(alert_text(config, offer, report["url"], now))
+    elif event == "mismatch":
+        send("⚠️ שינוי אפשרי בלוח הזמנים של LY385 ב־2.11.2026\n"
+             f"{report['reason']}\n"
+             "המעקב ממשיך לחפש רק את 06:10 ולא שולח התראת זמינות לשעה אחרת. "
+             "אם תרצה לעקוב אחרי השעה החדשה, כתוב זאת במפורש.\n" + report["url"])
     elif event == "error":
-        send("⚠️ שלוש בדיקות רצופות לא הצליחו לאמת זמינות ל־LY385.\n"
-             "אין להסיק שהטיסה מלאה. בדוק את ההרצה האחרונה ב־GitHub Actions.")
+        send("⚠️ שלוש בדיקות רצופות של LY385 לא הצליחו להשלים חיפוש מאומת.\n"
+             f"סיבה אחרונה: {report['reason']}\n"
+             "אין להסיק מכך שהטיסה מלאה. ההתראה הבאה מסוג זה תישלח לכל היותר בעוד 24 שעות.")
     elif event == "heartbeat":
-        send("✅ בדיקת המעקב היומית הצליחה.\n" +
-             ("טיסת LY385 לא הוצעה לרכישה בחיפוש האחרון; זו אינה הוכחה שהטיסה מלאה."
-              if status == ABSENT else "טיסת LY385 עדיין מוצגת עם הצעה לבחירה.") +
-             "\nתל אביב → רומא, 2.11.2026, 06:10.")
-    # Persist only AFTER notification succeeds, allowing retry if Telegram fails.
+        send("✅ בדיקה יומית: המעקב אחרי LY385 (2.11.2026, 06:10, TLV→FCO) פועל.\n" +
+             ("בחיפוש האחרון LY385 לא הוצעה לרכישה ב־Google Flights."
+              if status == ABSENT else "LY385 עדיין מוצעת לבחירה במחיר ₪%s." % offer["price"]) +
+             f"\nנבדק: {israel_time(now)}")
+    # Persist only after the notification succeeded, so a failed send is retried next hour.
     STATE.parent.mkdir(exist_ok=True)
-    STATE.write_text(json.dumps(next_state(state, status, now, event)))
-    print(f"Result: {status}. See diagnostics/report.json for the reason.")
+    STATE.write_text(json.dumps(next_state(state, status, now, event), indent=1))
+    print(f"Result: {status} - {report['reason']} (event: {event})")
     return 2 if status == UNKNOWN else 0
+
+
+def probe(config):
+    """Live adapter validation without Telegram or state: target date + same-flight positive control."""
+    target = inspect(config)[1]
+    control = inspect(config, config["positive_control_date"])[1]
+    write_report({"target": target, "positive_control": control})
+    for name, r in (("target", target), ("control", control)):
+        print(f"{name} {r['date']}: {r['status']} - {r['reason']}")
+    return 0 if control["status"] == AVAILABLE and target["status"] != UNKNOWN else 2
+
+
+def diagnose(config):
+    req = urllib.request.Request(ELAL_URL, headers={"User-Agent": gflights.UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            code, body = r.status, r.read(600).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        code, body = e.code, e.read(600).decode("utf-8", "replace")
+    except Exception as e:
+        code, body = None, type(e).__name__
+    body = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|[0-9a-f:]{8,}", "[ip omitted]", body)
+    print(f"EL AL booking site from this runner: HTTP {code}; {' '.join(body.split())[:200]}")
+    return probe(config)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["diagnose", "bootstrap", "test-telegram", "check"])
+    parser.add_argument("mode", choices=["probe", "diagnose", "bootstrap", "test-telegram", "check"])
     parser.add_argument("--username", default="")
     args = parser.parse_args()
     config = json.loads(CONFIG.read_text())
@@ -220,24 +193,23 @@ def main():
         bootstrap(args.username)
         return 0
     if args.mode == "test-telegram":
-        send("✅ הודעת בדיקה: הטלגרם מחובר. אין בהודעה זו מידע על זמינות טיסה.")
+        send("✅ הודעת בדיקה: הטלגרם מחובר למעקב LY385. אין בהודעה זו מידע על זמינות.")
         return 0
     if expired(config):
-        print("Flight departure has passed; no further airline requests.")
+        print("Flight departure has passed; no further searches.")
         return 0
-    url = search_url(args.mode)
-    if args.mode == "diagnose":
-        inspect_once(config, url, diagnostic=True)
-        print("Diagnostic saved. This run does not start monitoring or send flight alerts.")
-        return 0
-    return run_check(config, url)
+    if args.mode == "check":
+        for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            if not os.environ.get(key, "").strip():
+                raise RuntimeError(f"Missing {key} secret; check mode needs Telegram.")
+        return run_check(config)
+    return diagnose(config) if args.mode == "diagnose" else probe(config)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        # Never stringify browser/HTTP exceptions: their text can contain secret URLs.
         detail = str(exc) if isinstance(exc, RuntimeError) else "Operation failed; no credentials logged."
         write_report({"status": UNKNOWN, "reason": detail, "error_type": type(exc).__name__})
         print(f"UNKNOWN: {detail}")
